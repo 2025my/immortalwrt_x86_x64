@@ -110,6 +110,9 @@ jobs:
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
              
+    - name: Fix git short hash for dockerd build
+      run: git config --global core.abbrev 7
+
     - name: Compile the firmware
       id: compile
       run: |
