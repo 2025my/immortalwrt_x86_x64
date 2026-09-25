@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: 0 16 * * *
   workflow_dispatch:
+    inputs:
+      stage:
+        description: '构建模式：full=完整编译并发布固件；warmup=只编译，用于预热编译缓存'
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - warmup
 
 env:
   REPO_URL: https://github.com/DHDAXCW/immortalwrt
@@ -16,6 +25,11 @@ env:
   TZ: Asia/Shanghai
   OPENWRT_NAME: immortalwrt
   OPENWRT_NAME1: x86_64
+  STAGE: ${{ github.event.inputs.stage || 'full' }}
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 4G
+  CCACHE_COMPRESS: 'true'
+  CCACHE_COMPILERCHECK: content
 
 jobs:
   build:
@@ -31,12 +45,12 @@ jobs:
         remove-android: 'true'
         remove-haskell: 'true'
         remove-codeql: 'true'
-        
+
     - name: Check out the project branch
       uses: actions/checkout@main
       with:
           fetch-depth: 0
-          
+
     - name: Clean build caches
       run: |
         echo "Cleaning previous build artifacts and caches..."
@@ -47,7 +61,7 @@ jobs:
         sudo rm -rf /var/lib/apt/lists/* || true
         rm -rf ~/.cache/* || true
         echo "Cache cleanup complete."
-        
+
     - name: Initialize the compilation environment
       env:
         DEBIAN_FRONTEND: noninteractive
@@ -60,14 +74,14 @@ jobs:
         sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean ) &
         sudo timedatectl set-timezone "$TZ"
-        
+
     - name: Initialize Environment and Display System Info
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
         chmod +x $OPENWRT_NAME/*.sh
         $GITHUB_WORKSPACE/$OPENWRT_NAME/system-Information.sh
-        
+
     - name: Download firmware source code
       run: |
         git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
@@ -77,7 +91,7 @@ jobs:
       run: |
         ./scripts/feeds update -a
         ./scripts/feeds install -a
-        
+
     - name: Load feeds.conf.default
       run: |
         chmod +x $OPENWRT_NAME/*.sh
@@ -99,11 +113,21 @@ jobs:
         restore-keys: |
           openwrt-dl-
 
+    - name: Restore compile cache
+      id: cache-ccache
+      uses: actions/cache@v4
+      with:
+        path: .ccache
+        key: ccache-${{ github.ref_name }}-${{ github.run_id }}
+        restore-keys: |
+          ccache-${{ github.ref_name }}-
+
     - name: Download the installation package
       id: package
       run: |
         cd openwrt
         echo '
+        CONFIG_CCACHE=y
         CONFIG_DOCKER_CGROUP_OPTIONS=y
         CONFIG_DOCKER_NET_MACVLAN=y
         CONFIG_DOCKER_STO_EXT4=y
@@ -115,38 +139,54 @@ jobs:
         CONFIG_PACKAGE_luci-lib-docker=y
         ' >> .config
         make defconfig
+        mkdir -p "$CCACHE_DIR"
+        ccache -s || true
         make download -j16
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
-             
+
     - name: Compile the firmware
       id: compile
       run: |
         cd openwrt
         echo -e "$(nproc) thread compile"
-        # 分阶段编译，并在软件包编译完成后清理下载缓存，避免构建盘被写满
-        # 背景：构建盘约 101G，一次性 make world 会在安装阶段提示 No space left on device
-        make -j$(nproc) prepare || make -j1 V=s
+        echo "===== $(date -u '+%F %T') build start, stage=$STAGE ====="
         df -h .
-        make -j$(nproc) target/compile || make -j1 V=s
-        df -h .
-        make -j$(nproc) package/compile || make -j1 V=s
-        df -h .
-        # 软件包已全部编译完成，安装阶段不再需要源码包缓存，删除以释放数 GB 空间
-        du -sh dl build_dir staging_dir 2>/dev/null || true
-        rm -rf dl
-        df -h .
-        make -j$(nproc) package/install || make -j1 V=s
-        make -j$(nproc) target/install || make -j1 V=s
-        make -j$(nproc) package/index || make -j1 V=s
-        df -h .
+        ccache -s || true
+        # 分阶段编译：每完成一个阶段就打印磁盘占用，避免一次性 make world 把构建盘写满
+        # 并行失败时先并行重试一次，仍然失败才退回串行 V=s，避免动辄全量重编
+        stage_build() {
+          label="$1"
+          target="$2"
+          echo "===== $(date -u '+%T') start $label ====="
+          if ! make -j$(nproc) "$target"; then
+            echo "===== $(date -u '+%T') $label failed, retry in parallel ====="
+            if ! make -j$(nproc) "$target"; then
+              echo "===== $(date -u '+%T') $label failed again, final retry with -j1 V=s ====="
+              make -j1 V=s "$target"
+            fi
+          fi
+          echo "===== $(date -u '+%T') done $label ====="
+          df -h .
+        }
+        stage_build prepare prepare
+        stage_build target/compile target/compile
+        stage_build package/compile package/compile
+        ccache -s || true
+        du -sh dl build_dir staging_dir "$CCACHE_DIR" 2>/dev/null || true
+        if [ "$STAGE" != "warmup" ]; then
+          # 源码包缓存保留到安装阶段结束，避免安装时因缺少源码而触发重新下载和重编
+          stage_build package/install package/install
+          stage_build target/install target/install
+          stage_build package/index package/index
+        fi
         echo "date1=$(date +'%Y.%m.%d')" >> $GITHUB_ENV
         echo "date2=$(date "+%Y年%m月%d日")" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: Organize and Rename Files
       id: organize
-      if: ${{ env.UPLOAD_FIRMWARE == 'true' && !cancelled() }}
+      if: ${{ env.STAGE == 'full' && env.UPLOAD_FIRMWARE == 'true' && !cancelled() }}
       run: |
         cd openwrt/bin/targets/x86/64
         rm -rf packages *rootfs.tar.gz *rootfs.img.gz *combined.img.gz *.bin *.config *.buildinfo *.json sha256sums *.manifest
@@ -155,30 +195,30 @@ jobs:
         done
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
-        
+
     - name: Upload the firmware to github
       uses: actions/upload-artifact@main
-      if: steps.organize.outputs.status == 'success' && !cancelled()
+      if: ${{ env.STAGE == 'full' && steps.organize.outputs.status == 'success' && !cancelled() }}
       with:
         name: ${{ env.date1 }}_${{ env.OPENWRT_NAME }}_${{ env.OPENWRT_NAME1 }}
         path: ${{ env.FIRMWARE }}
 
     - name: Generate release tags
       id: tag
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      if: ${{ env.STAGE == 'full' && env.UPLOAD_RELEASE == 'true' && !cancelled() }}
       run: |
         echo "release_tag=${{ env.date2 }}" >> $GITHUB_OUTPUT
         touch release.txt
         echo "📥 固件下载" >> release.txt
         echo "status=success" >> $GITHUB_OUTPUT
-        
+
     - name: Publish to release
       uses: softprops/action-gh-release@v1
-      if: steps.tag.outputs.status == 'success' && !cancelled()
+      if: ${{ env.STAGE == 'full' && steps.tag.outputs.status == 'success' && !cancelled() }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         files: ${{ env.FIRMWARE }}/*
-        name: ${{ env.date3 }}
+        name: ${{ env.date2 }}
         tag_name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt
