@@ -115,7 +115,22 @@ jobs:
       run: |
         cd openwrt
         echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
+        # 分阶段编译，并在软件包编译完成后清理下载缓存，避免构建盘被写满
+        # 背景：构建盘约 101G，一次性 make world 会在安装阶段提示 No space left on device
+        make -j$(nproc) prepare || make -j1 V=s
+        df -h .
+        make -j$(nproc) target/compile || make -j1 V=s
+        df -h .
+        make -j$(nproc) package/compile || make -j1 V=s
+        df -h .
+        # 软件包已全部编译完成，安装阶段不再需要源码包缓存，删除以释放数 GB 空间
+        du -sh dl build_dir staging_dir 2>/dev/null || true
+        rm -rf dl
+        df -h .
+        make -j$(nproc) package/install || make -j1 V=s
+        make -j$(nproc) target/install || make -j1 V=s
+        make -j$(nproc) package/index || make -j1 V=s
+        df -h .
         echo "date1=$(date +'%Y.%m.%d')" >> $GITHUB_ENV
         echo "date2=$(date "+%Y年%m月%d日")" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
