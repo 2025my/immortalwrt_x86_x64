@@ -90,6 +90,15 @@ jobs:
         chmod +x $OPENWRT_NAME/*.sh && cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
 
+    - name: Restore source package cache
+      id: cache-dl
+      uses: actions/cache@v4
+      with:
+        path: openwrt/dl
+        key: openwrt-dl-${{ hashFiles('immortalwrt/x86_64/defconfig') }}
+        restore-keys: |
+          openwrt-dl-
+
     - name: Download the installation package
       id: package
       run: |
@@ -106,7 +115,7 @@ jobs:
         CONFIG_PACKAGE_luci-lib-docker=y
         ' >> .config
         make defconfig
-        make download -j$(nproc)
+        make download -j16
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
              
